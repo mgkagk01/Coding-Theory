@@ -43,7 +43,7 @@ class Scheme():
             else:
                 self.nrziCodeword[i] = currValue
 
-        checkPEPpatterns(self.nrziCodeword)
+
         return self.nrziCodeword
 
     # ========================= Decoder ========================= #

@@ -3,43 +3,26 @@ import numpy as np
 import numpy.matlib
 
 
+
+
 class PolarCode():
-    def __init__(self, n, k, N):
+    def __init__(self, n, k, designSNRdB):
         self.n = n
         self.k = k
-        self.codewords = np.zeros((N, n))
         self.R = k / n
-        self.N = int(np.log2(n))
+        self.height = int(np.log2(n))
         self.LLRs = np.zeros(self.n)
         # --- Import Reliability  Sequence
-        if n <= 64:
-            Q = np.flip(np.array(
-                [30, 32, 40, 44, 46, 47, 48, 52, 54, 55, 56, 58, 59, 60, 61, 62, 63, 64, 31, 28, 57, 24, 50, 53, 51, 45,
-                 43, 16,
-                 42, 29, 39, 27, 38, 26, 23,
-                 36, 22, 49, 15, 20, 41, 14, 37, 12, 25, 8, 34, 21, 35, 19, 13, 18, 11, 6, 7, 10, 33, 4, 17, 9, 1, 5, 2,
-                 3])) - 1
-        else:
-            Q = np.flip(np.genfromtxt("Q" + str(n) + ".csv", delimiter=',')) - 1
+        self.Q = np.genfromtxt("Q_N" + str(n) + "_K" + str(k) + "_SNR" + str(designSNRdB) + "dB.csv", delimiter=',').astype(int)
 
-        self.Q = Q[Q < n].astype(int)
         self.frozenPos = self.Q[0:n - self.k]
         self.msgPos = self.Q[n - self.k:n]
 
-    def encoder(self, msg, frozenValues, t):
+    def encoder(self, msg, frozenValues):
 
         # --- Initialization
         codeword = np.zeros(self.n)  # Create an array to work during the encoding
         m = 2  # Bits to combine
-
-        # --- Check if the values of the frozen bits are all 1, all 0 or random
-        if (isinstance(frozenValues, int)):
-            # --- Fixed number 1 or 0
-            if (frozenValues == 1):
-                # All values are 1
-                frozenValues = np.zeros(self.n - self.k) + 1
-            else:
-                frozenValues = np.zeros(self.n - self.k)
 
         # Define the first bits of the codeword
         codeword[self.msgPos] = msg
@@ -62,51 +45,91 @@ class PolarCode():
                 c = np.mod(a + b, 2)
                 codeword[i:i + m] = np.append([c], [b], axis=1)
 
-
             m *= 2
-        if (t >= 0):
-            self.codewords[t, :] = codeword
-        return codeword, frozenValues
 
+        return codeword
 
     # =====================================  Decoder =========================== #
-    def listDecoder(self, y, frozenValues, nL):
+    def listDecoder(self, y, nL, prob1):
+
         # --- Initiazations
-        L = np.zeros((self.n, nL, self.N + 1))  # beliefs for all decoders
-        uHat = 2 * np.ones((self.n, nL, self.N + 1))  # Decisions in nL decoders
+        L = np.zeros((self.n, self.height + 1, nL),dtype=np.float64)  # beliefs for all decoders
+        uHat = 2 * np.ones((self.n, self.height + 1, nL),dtype=np.float64)  # Decisions in nL decoders
+
         PML = np.Inf * np.ones(nL)  # Path metric
+
+        # ----------- To Save the results
+        nSysDecoded = 0
+
+
         PML[0] = 0
         stateVec = np.zeros((2 * self.n - 1))  # State vector, common for all  decoders
-        L[:, :, 0] = np.matlib.repmat(y, nL, 1).T  # belief for root
+        L[:, 0, :] = np.matlib.repmat(y, nL, 1).T  # belief for root
         node, depth, done = 0, 0, 0
+
 
 
         while (done == 0):  # Traversal loop
 
             # ==================== Leaf node  ==================== #
             # --- Check if you are on the leaf
-            if (depth == self.N):
-                DM = np.squeeze(L[node, :, self.N])  # Decision metric for all decoders
+            if (depth == self.height):
+
+                DM = L[node, self.height, :]  # Decision metric for all decoders
+
                 # --- Check if it is frozen
                 if (node in self.frozenPos):
-                    uHat[node, :, self.N] = frozenValues[np.where(self.frozenPos == node)]
-                    if (frozenValues[np.where(self.frozenPos == node)] > 0):
-                        PML = PML + DM
-                    else:
-                        PML = PML + np.multiply(abs(DM), 1 * (DM < 0))
+                    uHat[node,  self.height, :] = 0
+
+                    # Decide about the frozen bits
+                    dec = 1 * (DM < 0)
+
+                    # Compute the Log-Prob
+                    negLogProb, _ = LLR2nLogProb(DM, np.zeros(len(dec)))
+
+                    # Add this to the Path Metric
+                    PML = PML + negLogProb
 
                 else:
+                    # Make a decision
                     dec = 1 * (DM < 0)
-                    PM2 = np.concatenate((PML, PML + abs(DM)))
-                    pos, PML = minK(PM2, nL)
+
+                    # First PML assumes true bit Second assume erroneous
+                    negLogProbRightDecision, negLogProbWrongDecision = LLR2nLogProb(DM, dec)
+
+                    # if the bits are not equiprobable and it is time to prune, ask LLM to give the path probability
+                    if prob1 != 0.5 and sum(PML) < np.inf:
+
+                        # --- This is the function (compPathProb) that Kaushik has to change
+                        # Compute the probability of the path based on the distribution of the bits
+                        pathProbRightDecision, pathProbWrongDecision = compPathProb(
+                            uHat[self.msgPos[0:nSysDecoded], self.height, :], dec, prob1, nL)
+
+                        # Compute the total path metric = Conditional LLR + Prior LLR ( Negative Log Probabilities)
+                        temp = np.concatenate((pathProbRightDecision, pathProbWrongDecision))  # Prior
+                        PM2 = np.concatenate((PML + negLogProbRightDecision, PML + negLogProbWrongDecision)) + temp
+                        pos, PML = minK(PM2, nL)  # find the path with the smallest path metric
+                        PML = PML - temp[pos]  # remove the contribution from LLM
+                    else:
+
+                        # Just add the Decision Metric
+                        PM2 = np.concatenate((PML + negLogProbRightDecision, PML + negLogProbWrongDecision))
+                        pos, PML = minK(PM2, nL)
+
+                    # Find if there is a new list from the wrong decision
                     pos1 = 1 * (pos > (nL - 1))
+
+                    # Find the index of that list
                     idxPos = np.nonzero(pos1)
-                    pos[idxPos] = pos[idxPos] - nL
-                    dec = dec[pos]
-                    dec[idxPos] = 1 - dec[idxPos]
-                    L = L[:, pos, :]
-                    uHat = uHat[:, pos, :]
-                    uHat[node, :, self.N] = dec
+                    pos[idxPos] = pos[idxPos] - nL  # Normalize the index
+                    dec = dec[pos]  # finalize your decision
+                    dec[idxPos] = 1 - dec[idxPos]  # for the bit that belongs to the wrong path, change the value
+                    L = L[:, :, pos]  # Copy the LLR
+                    uHat = uHat[:, :, pos] # select the list that are active
+                    uHat[node, self.height, :] = dec
+
+                    # Count the number of decoded symbols
+                    nSysDecoded += 1
 
                 if (node == self.n - 1):
                     done = 1
@@ -123,13 +146,13 @@ class PolarCode():
                 # ---  If it is the first time that you hit a node
                 if (stateVec[npos] == 0):
 
-                    temp = int(2 ** (self.N - depth))
+                    temp = int(2 ** (self.height - depth))
                     # --- Incoming Beliefs
-                    Ln = np.squeeze(L[temp * node:temp * (node + 1), :, depth]).T
+                    Ln = L[temp * node:temp * (node + 1),  depth, :]
 
                     # --- Break beliefs into two
-                    a = Ln[:, 0:int(temp / 2)]
-                    b = Ln[:, int(temp / 2)::]
+                    a = Ln[0:int(temp / 2), :]
+                    b = Ln[int(temp / 2)::, :]
 
                     node = int(2 * node)
                     depth = int(depth + 1)
@@ -137,13 +160,8 @@ class PolarCode():
                     # --- Incoming belief length for left child
                     temp = int(temp / 2)
 
-                    # --- MinSum
-                    # if (minSum(a, b).T.size != sumProd(a, b).T.size):
-                    #     print()
-                    # L[temp * node:temp * (node + 1), :, depth] = minSum(a, b).T
-                    L[temp * node:temp * (node + 1), :, depth] = sumProd(a, b).T
-
-
+                    # --- Sum - Product # HERE
+                    L[temp * node:temp * (node + 1), depth, :] = sumProdLog(a, b)
                     stateVec[npos] = 1
 
 
@@ -151,20 +169,19 @@ class PolarCode():
                     # ==================== R Step  ==================== #
                     if (stateVec[npos] == 1):
 
-                        temp = int(2 ** (self.N - depth))
+                        temp = int(2 ** (self.height - depth))
                         # --- Incoming Beliefs
-                        Ln = np.squeeze(L[temp * node:temp * (node + 1), :, depth]).T
+                        Ln = L[temp * node:temp * (node + 1), depth, :]
 
                         # --- Incoming msg
                         nodeL = int(2 * node)
                         dL = int(depth + 1)
                         tempL = int(temp / 2)
-                        uHatn = np.squeeze(uHat[tempL * nodeL:tempL * (nodeL + 1), :, dL])
+                        uHatn = uHat[tempL * nodeL:tempL * (nodeL + 1), dL, :]
 
                         # --- Repetition decoding
-                        a = Ln[:, 0:int(temp / 2)]
-                        b = Ln[:, int(temp / 2)::]
-                        rept = g(a.T, b.T, uHatn)
+                        a = Ln[0:int(temp / 2), :]
+                        b = Ln[int(temp / 2)::, :]
 
                         # --- Move to the next node
                         # Next child left
@@ -177,56 +194,88 @@ class PolarCode():
                         stateVec[npos] = 2
 
                         # --- Save Beliefs
-                        L[temp * node:temp * (node + 1), :, depth] = rept
+                        L[temp * node:temp * (node + 1),  depth, :] = g(a, b, uHatn)
 
                     # ==================== U Step  ==================== #
                     else:
-                        temp = int(2 ** (self.N - depth))
+                        temp = int(2 ** (self.height - depth))
                         nodeL = int(2 * node)
                         nodeR = int(2 * node + 1)
                         dC = int(depth + 1)
                         tempC = int(temp / 2)
 
                         # --- Incoming decisions from the left child
-                        uHatL = np.squeeze(uHat[tempC * nodeL:tempC * (nodeL + 1), :, dC])
+                        uHatL = uHat[tempC * nodeL:tempC * (nodeL + 1), dC, :]
 
                         # --- Incoming decisions from the right child
-                        uHatR = np.squeeze(uHat[tempC * nodeR:tempC * (nodeR + 1), :, dC])
+                        uHatR = uHat[tempC * nodeR:tempC * (nodeR + 1), dC, :]
 
-                        uHat[temp * node:temp * (node + 1), :, depth] = np.vstack((((uHatL + uHatR) % 2), uHatR))
+                        uHat[temp * node:temp * (node + 1), depth, :] = np.vstack((((uHatL + uHatR) % 2), uHatR))
 
                         # --- Go back to parent
                         node = int(np.floor(node / 2))
                         depth = int(depth - 1)
-        return uHat[self.msgPos, :, self.N].T, PML
+
+        return uHat[self.msgPos, self.height, :], PML
 
     # ===================================== Functions for Decoders =========================== #
 
 
 
-def sumProd(a, b):
-    max = np.maximum(abs(a),abs(b))
+def sumProdLog(a, b):
 
-    r,c = np.where(max < 38)
+    # Two Steps
+    z1 = np.zeros(a.shape, dtype=np.float64)
 
-    result = np.zeros((a.shape))
-    result[r,c] = 2*np.arctanh(np.multiply(np.tanh(a[r,c]/2.0), np.tanh(b[r,c]/2.0)))
+    # Step 1:
+    temp = a + b
+    rows, columns = np.where(temp > 0)
+    z1[rows, columns] = temp[rows, columns] + np.log1p(np.exp(-temp[rows, columns]))
 
-    r, c = np.where(max >= 38)
-    result[r,c] = minSum(a[r,c], b[r,c])
+    rows, columns = np.where(temp < 0)
+    z1[rows, columns] = np.log1p(np.exp(temp[rows, columns]))
 
-    return result
+    # Step 2:
+    return z1 - logdomain_sum(a, b)
+
+
+
+def logdomain_sum(x, y):
+    """
+    Find the addition of x and y in log-domain. It uses log1p to improve numerical stability.
+
+    Parameters
+    ----------
+    x: float
+        any number in the log-domain
+    y: float
+        any number in the log-domain
+
+    Returns
+    ----------
+    float
+        the result of x + y
+
+    """
+    z = np.zeros(x.shape,dtype=np.float64)
+
+    rows, columns= np.where(x > y)
+    z[rows,columns] = x[rows,columns] + np.log1p(np.exp(y[rows,columns] - x[rows,columns]))
+
+    rows, columns = np.where(x < y)
+    z[rows, columns] = y[rows, columns] + np.log1p(np.exp(x[rows, columns] - y[rows, columns]))
+
+    return z
 
 
 
 def g(a, b, c):
-    return b + np.multiply((1 - 2 * c), a)
+    return (b + np.multiply((1 - 2 * c), a))
 
 
 def minK(a, k):
     idx = (a).argsort()[:k]
     return idx, a[idx]
-
 
 
 def minSum(a, b):
@@ -239,4 +288,49 @@ def minSum(a, b):
     return np.multiply(magn, sign)
 
 
+def LLR2nLogProb(LLR, dec):
 
+    firstPath = np.zeros(LLR.shape[0])
+    secondPath = np.zeros(LLR.shape[0])
+
+    # Moon's Book (1st edition) Page 866 eq. 17.94
+    # First Path # Correct Path
+    xf = -(1 - 2 * dec) * LLR
+
+    loc = np.where(xf > 40)[0]
+    firstPath[loc] = xf[loc]
+    loc = np.where(xf <= 40)[0]
+    firstPath[loc] = np.log(1 + np.exp(xf[loc]))
+
+    # Moon's Book (1st edition) Page 866 eq. 17.94
+    # Second Path  # Wrong Path
+    dec = (dec + 1) % 2
+    xs = (2 * dec - 1) * LLR
+
+    loc = np.where(xs > 40)[0]
+    secondPath[loc] = xs[loc]
+    loc = np.where(xs <= 40)[0]
+    secondPath[loc] = np.log(1 + np.exp(xs[loc]))
+
+
+    return firstPath, secondPath
+
+
+def compPathProb(currMsgsHat, newMsgsHat, prob1, nL):
+    # Extent the Current path to include the next nL decoders
+    extentCurr = np.hstack((currMsgsHat, currMsgsHat))
+
+    # Compute the probability for each bit
+    currProb = 1 * (extentCurr == 0) * (1 - prob1) + 1 * (extentCurr == 1) * (prob1)
+
+    # Extent the new decision metric to include the next nL decoders
+    extentNew = np.hstack((newMsgsHat, (newMsgsHat + 1) % 2))
+
+    # Compute the probability for each bit
+    newProb = 1 * (extentNew == 0) * (1 - prob1) + 1 * (extentNew == 1) * (prob1)
+
+    # Compute the log probability of the 2*nL decoders
+    totalProb = sum(np.log(currProb)) + sum(np.log(newProb))
+
+    # Return results
+    return -totalProb[0:nL], -totalProb[nL::]

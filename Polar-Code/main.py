@@ -1,5 +1,5 @@
 import numpy as np
-from PolarCode import PolarCode
+from ChannelCode import ChannelCode
 
 
 np.random.seed(0)
